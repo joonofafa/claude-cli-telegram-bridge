@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude CLI Telegram Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=jhsoft
+WorkingDirectory=/home/jhsoft
+EnvironmentFile=/home/jhsoft/gitHub/claude-cli-telegram-bridge/.env
+ExecStart=/usr/bin/python3 /home/jhsoft/gitHub/claude-cli-telegram-bridge/bot.py
+Restart=always
+RestartSec=10
+Environment=HOME=/home/jhsoft
+Environment=PATH=/home/jhsoft/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
