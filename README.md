@@ -2,6 +2,14 @@
 
 Bridge between [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) and Telegram. Send messages to your Telegram bot, get responses from Claude — with real-time progress updates, session management, and image analysis.
 
+## Highlights
+
+- Use Telegram as a remote interface for Claude Code CLI
+- Stream progress while Claude reads files, runs commands, and edits code
+- Resume prior CLI sessions from chat
+- Send photos for image-aware prompts
+- Restrict access with a Telegram user allowlist
+
 ## Features
 
 - **Claude CLI integration** — Uses `claude -p` with `stream-json` for real-time streaming
@@ -24,7 +32,7 @@ Bridge between [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/your-username/claude-cli-telegram-bridge.git
+git clone https://github.com/joonofafa/claude-cli-telegram-bridge.git
 cd claude-cli-telegram-bridge
 pip install -r requirements.txt
 ```
