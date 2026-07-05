@@ -9,9 +9,11 @@ import os
 import logging
 import random
 import time
-from telegram import Update
+import urllib.parse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+                          filters, ContextTypes)
 
 # --- Configuration via environment variables ---
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -22,6 +24,8 @@ LOG_FILE = os.environ.get("LOG_FILE", "/var/log/claude-telegram-bot.log")
 SESSION_DIR = os.environ.get("SESSION_DIR", os.path.expanduser("~/.claude/projects"))
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
 WORKING_DIR = os.environ.get("WORKING_DIR", os.path.expanduser("~"))
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/claude-telegram-uploads")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,6 +40,120 @@ logger = logging.getLogger(__name__)
 sessions = {}
 cached_session_list = {}
 user_queues = {}
+
+
+# --- 영속 claude 프로세스 + stdin/stdout stream-json (OAuth 유지) ---
+# 사용자당 claude 프로세스 1개를 띄워 stdin으로 턴을 흘려보낸다.
+# 셸 조립/_shell_quote 불필요(인젝션 안전), 같은 프로세스라 매 턴 --resume 불필요.
+def _encode_user_turn(text: str) -> bytes:
+    """stdin용 NDJSON 한 줄. ⚠️ 미문서화 포맷(claude-code#24594) — 여기만 고치면 됨."""
+    obj = {"type": "user",
+           "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+
+
+class ClaudeSession:
+    def __init__(self):
+        self.proc = None
+        self.session_id = None
+        self.last_activity = 0.0
+        self._lock = asyncio.Lock()  # 한 프로세스에 턴이 겹치지 않게 직렬화
+
+    async def _ensure_proc(self):
+        if self.proc and self.proc.returncode is None:
+            return
+        cmd = [CLAUDE_PATH, "-p",
+               "--input-format", "stream-json",
+               "--output-format", "stream-json",
+               "--verbose",
+               "--allowedTools", ALLOWED_TOOLS]
+        if self.session_id:  # kill 후 재spawn이면 디스크 세션 복원
+            cmd += ["--resume", self.session_id]
+        self.proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # stream-json은 이벤트 1개 = 1줄(NDJSON). 큰 파일 Read / 대용량 Bash
+            # 출력이 통째로 한 줄에 담기면 readline()이 버퍼 한계를 넘어
+            # "Separator is not found, and chunk exceed the limit"로 터진다.
+            limit=64 * 1024 * 1024,
+            cwd=WORKING_DIR)
+
+    async def send(self, text, on_tool=None) -> str:
+        async with self._lock:
+            await self._ensure_proc()
+            self.proc.stdin.write(_encode_user_turn(text))
+            await self.proc.stdin.drain()
+            self.last_activity = asyncio.get_event_loop().time()
+            result = ""
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    self.proc = None  # 프로세스 종료
+                    break
+                self.last_activity = asyncio.get_event_loop().time()
+                line = line.decode(errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type")
+                if etype == "system" and event.get("subtype") == "init":
+                    self.session_id = event.get("session_id") or self.session_id
+                if etype == "assistant" and on_tool:
+                    for block in event.get("message", {}).get("content", []) or []:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            inp = block.get("input", {})
+                            desc = (inp.get("description") or inp.get("file_path")
+                                    or inp.get("command") or inp.get("pattern") or "")
+                            on_tool(block.get("name", ""), str(desc))
+                if etype == "result":
+                    self.session_id = event.get("session_id") or self.session_id
+                    result = event.get("result", "") or ""
+                    break
+            return result
+
+    def is_idle(self):
+        return self.proc is not None and \
+            (asyncio.get_event_loop().time() - self.last_activity) > IDLE_TIMEOUT
+
+    async def close(self):
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.stdin.close()
+                self.proc.kill()
+                await self.proc.wait()
+            except Exception:
+                pass
+        self.proc = None
+
+
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}
+
+    def get(self, chat_id) -> ClaudeSession:
+        if chat_id not in self.sessions:
+            self.sessions[chat_id] = ClaudeSession()
+        return self.sessions[chat_id]
+
+    async def reset(self, chat_id):
+        if chat_id in self.sessions:
+            await self.sessions[chat_id].close()
+            self.sessions[chat_id].session_id = None
+
+    async def reaper(self):
+        while True:
+            await asyncio.sleep(30)
+            for cs in list(self.sessions.values()):
+                if cs.is_idle():
+                    await cs.close()  # 프로세스만 정리, session_id는 보존
+
+
+claude_sessions = SessionManager()
 
 PROGRESS_MESSAGES = [
     "Analyzing...",
@@ -153,8 +271,53 @@ def md_to_tg(text: str) -> str:
     return text
 
 
+async def extract_and_send_images(chat_id, text, bot):
+    """Find markdown images in text, send them as photos to Telegram, and replace them with placeholder text."""
+    img_pattern = re.compile(r'!\[(.*?)\]\(([^)]+)\)')
+    matches = img_pattern.findall(text)
+    
+    cleaned_text = text
+    for caption, path in matches:
+        resolved_path = path.strip()
+        if resolved_path.startswith("file://"):
+            resolved_path = resolved_path[7:]
+        resolved_path = urllib.parse.unquote(resolved_path)
+        
+        # Check if local file exists
+        if os.path.exists(resolved_path) and os.path.isfile(resolved_path):
+            try:
+                with open(resolved_path, 'rb') as photo_file:
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo_file,
+                        caption=caption if caption else None
+                    )
+                img_tag = f"![{caption}]({path})"
+                cleaned_text = cleaned_text.replace(img_tag, f"🖼️ *{caption or 'Image'}*")
+            except Exception as img_err:
+                logger.error(f"Failed to send local photo {resolved_path}: {img_err}")
+        elif resolved_path.startswith(("http://", "https://")):
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=resolved_path,
+                    caption=caption if caption else None
+                )
+                img_tag = f"![{caption}]({path})"
+                cleaned_text = cleaned_text.replace(img_tag, f"🖼️ *{caption or 'Image'}*")
+            except Exception as img_err:
+                logger.error(f"Failed to send remote photo {resolved_path}: {img_err}")
+                
+    return cleaned_text
+
+
 async def send_md(chat_id, text, bot):
     """Send with MarkdownV2, fallback to plain text on failure"""
+    try:
+        text = await extract_and_send_images(chat_id, text, bot)
+    except Exception as e:
+        logger.error(f"Failed to extract/send images: {e}")
+
     try:
         md_text = md_to_tg(text)
         if len(md_text) > 4000:
@@ -189,7 +352,7 @@ async def run_command(cmd: str, timeout: int = 30) -> str:
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
-            limit=1024 * 1024,
+            limit=64 * 1024 * 1024,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -213,6 +376,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in sessions:
         del sessions[user_id]
+    await claude_sessions.reset(user_id)
     await update.message.reply_text("Session reset.")
 
 
@@ -263,8 +427,26 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Recent sessions:\n"]
     for s in sess_list:
         lines.append(f"{s['idx']}. [{s['date']}] {s['msg']}")
-    lines.append("\nUse /resume <number> to continue a session.")
-    await update.message.reply_text("\n".join(lines))
+    lines.append("\nTap a session below to resume it.")
+    # 각 세션을 탭-투-resume 인라인 버튼으로. callback_data는 64바이트 제한이라 idx만 싣는다.
+    keyboard = [[InlineKeyboardButton(f"{s['idx']}. [{s['date']}] {s['msg'][:30]}",
+                                      callback_data=f"resume:{s['idx']}")]
+                for s in sess_list]
+    await update.message.reply_text("\n".join(lines),
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+def _resume_by_idx(user_id, idx):
+    """캐시된 세션 목록에서 idx(1-based) 세션을 활성화. (성공여부, 메시지) 반환."""
+    sess_list = cached_session_list.get(user_id)
+    if not sess_list:
+        return False, "Run /sessions first."
+    if idx < 1 or idx > len(sess_list):
+        return False, f"Enter a number between 1 and {len(sess_list)}."
+    selected = sess_list[idx-1]
+    sessions[user_id] = selected["sid"]
+    return True, (f"Session restored: [{selected['date']}] {selected['msg']}\n\n"
+                  "Messages will now continue in this session.")
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,43 +462,50 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Please enter a number.")
         return
-    sess_list = cached_session_list.get(user_id)
-    if not sess_list:
-        await update.message.reply_text("Run /sessions first.")
+    _, msg = _resume_by_idx(user_id, idx)
+    await update.message.reply_text(msg)
+
+
+async def on_resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sessions 인라인 버튼(resume:<idx>) 탭 처리."""
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Not authorized.")
         return
-    if idx < 1 or idx > len(sess_list):
-        await update.message.reply_text(f"Enter a number between 1 and {len(sess_list)}.")
+    await query.answer()
+    try:
+        idx = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
         return
-    selected = sess_list[idx-1]
-    sessions[user_id] = selected["sid"]
-    await update.message.reply_text(f"Session restored: [{selected['date']}] {selected['msg']}\n\nMessages will now continue in this session.")
+    ok, msg = _resume_by_idx(query.from_user.id, idx)
+    await query.message.reply_text(msg)
 
 
-async def process_claude_message(chat_id, user_id, message, bot):
-    """Run Claude CLI with stream-json and send progress updates"""
-    session_id = sessions.get(user_id)
-    base_cmd = f'{CLAUDE_PATH} -p {_shell_quote(message)} --output-format stream-json --verbose --max-turns 0 --allowedTools "{ALLOWED_TOOLS}"'
-    if session_id:
-        base_cmd += f' --resume {session_id}'
-    cmd = f'{base_cmd} 2>/dev/null'
+async def process_claude_message(chat_id, user_id, message, bot, cleanup_paths=None):
+    """영속 claude 프로세스에 stdin으로 한 턴 전송 + 진행상황 중계"""
+    cleanup_paths = cleanup_paths or []
+    cs = claude_sessions.get(user_id)
 
-    logger.info(f"CMD: {cmd[:200]}")
+    # /resume 으로 사용자가 다른 세션을 골랐으면 라이브 프로세스를 재바인딩
+    desired = sessions.get(user_id)
+    if desired and desired != cs.session_id:
+        await cs.close()
+        cs.session_id = desired
 
-    progress_msg = None
-    turn_count = 0
-    last_activity = asyncio.get_event_loop().time()
-    last_result = ""
-    new_session_id = None
+    logger.info(f"STREAM user={user_id} sid={cs.session_id} msg={message[:80]!r}")
+
+    progress = {"msg": None, "lock": asyncio.Lock(), "done": False}
+    typing_task = None
+
+    def on_tool(tool_name, desc):
+        if tool_name in ("Read", "Edit", "Write") and desc:
+            desc = os.path.basename(desc)
+        status = f"{random.choice(PROGRESS_MESSAGES)} [{tool_name}"
+        status += f": {desc[:30]}]" if desc else "]"
+        # 콜백은 동기 → 텔레그램 호출은 태스크로 띄움
+        asyncio.create_task(_update_progress(bot, chat_id, progress, status))
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            limit=1024 * 1024,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=WORKING_DIR
-        )
-
         async def keep_typing():
             while True:
                 await bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -324,95 +513,17 @@ async def process_claude_message(chat_id, user_id, message, bot):
 
         typing_task = asyncio.create_task(keep_typing())
 
-        async def read_stream():
-            nonlocal turn_count, last_result, new_session_id, progress_msg, last_activity
-            while True:
-                line = await proc.stdout.readline()
-                last_activity = asyncio.get_event_loop().time()
-                if not line:
-                    break
-                line = line.decode().strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        last_result = await cs.send(message, on_tool=on_tool)
 
-                etype = event.get("type", "")
+        if cs.session_id:
+            sessions[user_id] = cs.session_id
 
-                if etype == "assistant" and event.get("message", {}).get("role") == "assistant":
-                    content = event.get("message", {}).get("content", [])
-                    for block in content if isinstance(content, list) else []:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            turn_count += 1
-                            tool_name = block.get("name", "")
-                            desc = ""
-                            tool_input = block.get("input", {})
-                            if tool_name == "Bash":
-                                desc = tool_input.get("description", tool_input.get("command", "")[:40])
-                            elif tool_name in ("Read", "Edit", "Write"):
-                                desc = tool_input.get("file_path", "")
-                                if desc:
-                                    desc = os.path.basename(desc)
-                            elif tool_name in ("Glob", "Grep"):
-                                desc = tool_input.get("pattern", "")
-
-                            status = f"{random.choice(PROGRESS_MESSAGES)} [{tool_name}"
-                            if desc:
-                                status += f": {desc[:30]}]"
-                            else:
-                                status += "]"
-
-                            try:
-                                if progress_msg:
-                                    await bot.edit_message_text(
-                                        chat_id=chat_id,
-                                        message_id=progress_msg.message_id,
-                                        text=status
-                                    )
-                                else:
-                                    progress_msg = await bot.send_message(chat_id=chat_id, text=status)
-                            except Exception:
-                                pass
-
-                if etype == "result":
-                    last_result = event.get("result", "")
-                    new_session_id = event.get("session_id")
-                    errors = event.get("errors", [])
-                    if errors:
-                        logger.warning(f"Claude errors: {errors}")
-                        last_result = errors[0]
-                    if not last_result and event.get("subtype") == "error_max_turns":
-                        last_result = "Turn limit reached. Send another message to continue."
-                    elif not last_result:
-                        logger.warning(f"Empty result. subtype={event.get('subtype')}")
-
-        async def watchdog():
-            while True:
-                await asyncio.sleep(10)
-                elapsed = asyncio.get_event_loop().time() - last_activity
-                if elapsed > IDLE_TIMEOUT:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    return
-
-        watchdog_task = asyncio.create_task(watchdog())
-        await read_stream()
-        watchdog_task.cancel()
-
-        if proc.returncode is None:
-            await proc.wait()
-        await proc.wait()
-
-        if new_session_id:
-            sessions[user_id] = new_session_id
-
-        if progress_msg:
+        # 완료 표시를 락 안에서 세워 뒤늦은 on_tool 태스크가 새 메시지를 못 만들게 한다.
+        async with progress["lock"]:
+            progress["done"] = True
+        if progress["msg"]:
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
+                await bot.delete_message(chat_id=chat_id, message_id=progress["msg"].message_id)
             except Exception:
                 pass
 
@@ -425,20 +536,58 @@ async def process_claude_message(chat_id, user_id, message, bot):
         logger.error(f"Claude error: {e}")
         await bot.send_message(chat_id=chat_id, text=f"Error: {e}")
     finally:
-        typing_task.cancel()
+        if typing_task:
+            typing_task.cancel()
+        for path in cleanup_paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to remove temp file {path}: {cleanup_err}")
+
+
+async def _update_progress(bot, chat_id, progress, status):
+    async with progress["lock"]:
+        if progress["done"]:  # 턴이 끝난 뒤 도착한 태스크는 새 메시지를 만들지 않는다
+            return
+        try:
+            if progress["msg"]:
+                await bot.edit_message_text(chat_id=chat_id,
+                                            message_id=progress["msg"].message_id, text=status)
+            else:
+                progress["msg"] = await bot.send_message(chat_id=chat_id, text=status)
+        except Exception:
+            pass
 
 
 async def queue_worker(user_id, bot):
     """Per-user message queue worker for sequential processing"""
     queue = user_queues[user_id]
     while True:
-        chat_id, message = await queue.get()
+        chat_id, message, cleanup_paths = await queue.get()
         try:
-            await process_claude_message(chat_id, user_id, message, bot)
+            await process_claude_message(chat_id, user_id, message, bot, cleanup_paths)
         except Exception as e:
             logger.error(f"Queue worker error: {e}")
         finally:
             queue.task_done()
+
+
+async def enqueue_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message, cleanup_paths=None):
+    """공용 큐 적재 헬퍼 — 사용자별 워커 보장 + cleanup 경로 전달"""
+    user_id = update.effective_user.id
+    chat_id = update.message.chat_id
+
+    if user_id not in user_queues:
+        user_queues[user_id] = asyncio.Queue()
+        asyncio.create_task(queue_worker(user_id, context.bot))
+
+    queue = user_queues[user_id]
+    if queue.qsize() > 0:
+        await update.message.reply_text(f"{queue.qsize()} message(s) queued. Will respond in order.")
+
+    await queue.put((chat_id, message, cleanup_paths or []))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,19 +595,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    chat_id = update.message.chat_id
     message = update.message.text
     logger.info(f"User {user_id}: {message[:100]}")
-
-    if user_id not in user_queues:
-        user_queues[user_id] = asyncio.Queue()
-        asyncio.create_task(queue_worker(user_id, context.bot))
-
-    queue = user_queues[user_id]
-    if queue.qsize() > 0:
-        await update.message.reply_text(f"{queue.qsize()} message(s) queued. Will respond in order.")
-
-    await queue.put((chat_id, message))
+    await enqueue_message(update, context, message)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,27 +605,100 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    chat_id = update.message.chat_id
-    caption = update.message.caption or "Analyze this image"
+    caption = (update.message.caption or "Analyze this image").strip()
     logger.info(f"User {user_id} sent photo: {caption[:100]}")
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-    img_path = f"/tmp/telegram_img_{int(time.time())}.jpg"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    img_path = os.path.join(UPLOAD_DIR, f"photo_{time.time_ns()}.jpg")
     await file.download_to_drive(img_path)
     logger.info(f"Photo saved: {img_path}")
 
     message = f"{caption}\n\nImage file path: {img_path}"
+    await enqueue_message(update, context, message, [img_path])
 
-    if user_id not in user_queues:
-        user_queues[user_id] = asyncio.Queue()
-        asyncio.create_task(queue_worker(user_id, context.bot))
 
-    queue = user_queues[user_id]
-    if queue.qsize() > 0:
-        await update.message.reply_text(f"{queue.qsize()} message(s) queued. Will respond in order.")
+def safe_upload_name(filename, fallback="attachment") -> str:
+    name = os.path.basename(filename or fallback)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name or fallback
 
-    await queue.put((chat_id, message))
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+
+    user_id = update.effective_user.id
+    document = update.message.document
+    caption = (update.message.caption or "Review this attached file").strip()
+    safe_name = safe_upload_name(document.file_name)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(UPLOAD_DIR, f"doc_{time.time_ns()}_{safe_name}")
+
+    tg_file = await context.bot.get_file(document.file_id)
+    await tg_file.download_to_drive(local_path)
+
+    suffix = os.path.splitext(local_path)[1].lower()
+    mime_type = document.mime_type or ""
+    is_image = suffix in IMAGE_EXTENSIONS or mime_type.startswith("image/")
+    kind = "이미지 파일" if is_image else "첨부 파일"
+    message = (
+        f"{caption}\n\n"
+        f"Claude가 확인할 수 있도록 {kind}을 로컬에 저장했습니다.\n"
+        f"Local file path: {local_path}\n"
+        f"Original filename: {document.file_name or safe_name}\n"
+        f"MIME type: {mime_type or 'unknown'}\n\n"
+        "위 경로를 Read 도구로 읽어 내용을 확인하세요."
+    )
+
+    logger.info(f"User {user_id} sent document: {safe_name}")
+    await enqueue_message(update, context, message, [local_path])
+
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+
+    user_id = update.effective_user.id
+    location = update.message.location
+    message = (
+        "User shared a Telegram location.\n\n"
+        f"Latitude: {location.latitude}\n"
+        f"Longitude: {location.longitude}\n"
+        f"Map: https://maps.google.com/?q={location.latitude},{location.longitude}"
+    )
+    if location.horizontal_accuracy is not None:
+        message += f"\nHorizontal accuracy: {location.horizontal_accuracy} meters"
+    if location.live_period is not None:
+        message += f"\nLive period: {location.live_period} seconds"
+    if location.heading is not None:
+        message += f"\nHeading: {location.heading}"
+    if location.proximity_alert_radius is not None:
+        message += f"\nProximity alert radius: {location.proximity_alert_radius} meters"
+
+    logger.info(f"User {user_id} sent location: {location.latitude},{location.longitude}")
+    await enqueue_message(update, context, message)
+
+
+async def handle_venue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+
+    user_id = update.effective_user.id
+    venue = update.message.venue
+    location = venue.location
+    message = (
+        "User shared a Telegram venue.\n\n"
+        f"Title: {venue.title}\n"
+        f"Address: {venue.address}\n"
+        f"Latitude: {location.latitude}\n"
+        f"Longitude: {location.longitude}\n"
+        f"Map: https://maps.google.com/?q={location.latitude},{location.longitude}"
+    )
+
+    logger.info(f"User {user_id} sent venue: {venue.title}")
+    await enqueue_message(update, context, message)
 
 
 def _shell_quote(s: str) -> str:
@@ -494,14 +706,28 @@ def _shell_quote(s: str) -> str:
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    async def _post_init(application):
+        asyncio.create_task(claude_sessions.reaper())  # idle 프로세스 정리
+        # ☰ 메뉴 버튼에 명령어 목록 등록
+        await application.bot.set_my_commands([
+            BotCommand("start", "Show help"),
+            BotCommand("sessions", "List recent sessions"),
+            BotCommand("resume", "Resume a session by number"),
+            BotCommand("reset", "Start a new session"),
+        ])
+
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CallbackQueryHandler(on_resume_button, pattern=r"^resume:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.VENUE, handle_venue))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
     async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_authorized(update.effective_user.id):
